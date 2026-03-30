@@ -1,0 +1,234 @@
+-- ------------------------------------------------------------------------------
+-- 1. Receita Mensal e Crescimento (MoM)
+-- Escreva uma consulta que calcule a receita total (baseada apenas em pedidos 
+-- com status 'Completed') agrupada por mês e ano. Adicione uma coluna calculando 
+-- a variação percentual da receita em relação ao mês anterior.
+-- ------------------------------------------------------------------------------
+WITH total AS (
+    SELECT 
+        DATE_FORMAT(order_date, '%Y-%m-01') AS mes,
+        SUM(total_amount) AS total
+    FROM orders
+    WHERE status = 'Completed'
+    GROUP BY DATE_FORMAT(order_date, '%Y-%m-01')
+),
+mes_ant AS (
+    SELECT 
+        *,
+        LAG(total) OVER (ORDER BY mes) AS anterior 
+    FROM total
+)
+SELECT 
+    mes, 
+    total,
+    COALESCE(
+        ROUND(100.0 * (total - anterior) / NULLIF(anterior, 0), 2), 0
+    ) AS MoM
+FROM mes_ant
+ORDER BY mes;
+
+
+-- ------------------------------------------------------------------------------
+-- 2. LTV (Lifetime Value) dos Top Clientes
+-- Identifique os 5 usuários mais valiosos da empresa com base no valor total de 
+-- pagamentos bem-sucedidos (status = 'Successful'). O relatório deve trazer o 
+-- ID do usuário, nome completo, país e o valor total gasto por eles.
+-- ------------------------------------------------------------------------------
+SELECT 
+    u.user_id, 
+    CONCAT(u.first_name, ' ', u.last_name) AS full_name, 
+    u.country,
+    SUM(DISTINCT o.total_amount) AS total
+FROM users u
+JOIN orders o ON u.user_id = o.user_id
+JOIN payments p ON o.order_id = p.order_id
+WHERE p.status = 'Successful' 
+  AND p.payment_method IS NOT NULL
+GROUP BY u.user_id, full_name, u.country
+ORDER BY total DESC
+LIMIT 5;
+
+
+-- ------------------------------------------------------------------------------
+-- 3. Margem de Lucro por Categoria de Produto
+-- Considerando apenas os pedidos concluídos, qual é a margem de lucro total gerada 
+-- por cada categoria de produto? Ordene da categoria mais lucrativa para a menos.
+-- ------------------------------------------------------------------------------
+SELECT 
+    p.category,
+    SUM(oi.quantity * oi.unit_price) AS receita,
+    SUM(oi.quantity * p.cost) AS custo,
+    SUM(oi.quantity * (oi.unit_price - p.cost)) AS lucro
+FROM order_items oi
+JOIN products p ON oi.product_id = p.product_id
+JOIN orders o ON oi.order_id = o.order_id
+WHERE o.status = 'Completed'
+GROUP BY p.category
+ORDER BY lucro DESC;
+
+
+-- ------------------------------------------------------------------------------
+-- 4. Taxa de Conversão por Dispositivo (Device)
+-- Calcule a taxa de conversão (is_conversion = TRUE) para cada tipo de dispositivo 
+-- (device_type) nas sessões web. A saída deve mostrar o tipo de dispositivo, o total 
+-- de sessões, o total de conversões e a taxa percentual de conversão.
+-- ------------------------------------------------------------------------------
+SELECT 
+    device_type,
+    COUNT(*) AS total,
+    COUNT(CASE WHEN is_conversion = TRUE THEN 1 END) AS qtde_conv,
+    ROUND(
+        100.0 * COUNT(CASE WHEN is_conversion = TRUE THEN 1 END) / NULLIF(COUNT(*), 0), 2
+    ) AS perc
+FROM web_sessions 
+GROUP BY device_type
+ORDER BY qtde_conv DESC; 
+
+
+-- ------------------------------------------------------------------------------
+-- 5. Análise de Recência (RFM - Recency)
+-- Para todos os usuários ativos (is_active = TRUE), calcule quantos dias se passaram 
+-- desde a sua última compra concluída. Classifique os usuários do mais recente 
+-- para o menos recente.
+-- ------------------------------------------------------------------------------
+SELECT 
+    CONCAT(u.first_name, ' ', u.last_name) AS nome,
+    DATEDIFF(DATE(NOW()), MAX(o.order_date)) AS dias_ult_compra
+FROM users u
+LEFT JOIN orders o ON u.user_id = o.user_id AND o.status = 'Completed'
+WHERE u.is_active = TRUE
+GROUP BY u.user_id, nome
+ORDER BY dias_ult_compra ASC;
+
+
+-- ------------------------------------------------------------------------------
+-- 6. Ticket Médio (AOV) por Método de Pagamento
+-- Qual é o valor médio dos pedidos (Average Order Value) que tiveram pagamentos 
+-- bem-sucedidos, quebrado pelo método de pagamento (payment_method)?
+-- ------------------------------------------------------------------------------
+SELECT 
+    p.payment_method,
+    ROUND(AVG(DISTINCT o.total_amount), 2) AS media
+FROM orders o
+JOIN payments p ON o.order_id = p.order_id 
+WHERE p.status = 'Successful' 
+  AND o.status = 'Completed'
+GROUP BY p.payment_method
+ORDER BY media DESC;
+
+
+-- ------------------------------------------------------------------------------
+-- 7. Análise de Cohort e Retenção Básica
+-- Identifique os usuários que fizeram sua primeira compra em 2023. Dentre eles, 
+-- quantos realizaram uma segunda compra em até 90 dias após a primeira compra? 
+-- Mostre o total de usuários da base (cohort) e a taxa de retenção em percentual.
+-- ------------------------------------------------------------------------------
+WITH first_purchase AS (
+    SELECT 
+        user_id,
+        MIN(order_date) AS first_order_date
+    FROM orders
+    WHERE status = 'Completed'
+    GROUP BY user_id
+),
+cohort_2023 AS (
+    SELECT 
+        user_id, 
+        first_order_date
+    FROM first_purchase
+    WHERE YEAR(first_order_date) = 2023
+),
+second_purchase AS (
+    SELECT 
+        c.user_id, 
+        c.first_order_date,
+        MIN(o.order_date) AS second_order_date
+    FROM cohort_2023 c
+    JOIN orders o ON c.user_id = o.user_id
+                 AND o.order_date > c.first_order_date
+                 AND o.status = 'Completed'
+    GROUP BY c.user_id, c.first_order_date
+)
+SELECT 
+    COUNT(DISTINCT c.user_id) AS total_cohort,
+    COUNT(DISTINCT CASE WHEN DATEDIFF(s.second_order_date, c.first_order_date) <= 90 THEN c.user_id END) AS retornaram_ate_90_dias,
+    ROUND(
+        100.0 * COUNT(DISTINCT CASE WHEN DATEDIFF(s.second_order_date, c.first_order_date) <= 90 THEN c.user_id END) 
+        / COUNT(DISTINCT c.user_id), 2
+    ) AS taxa_retencao_percentual
+FROM cohort_2023 c
+LEFT JOIN second_purchase s ON c.user_id = s.user_id;
+
+
+-- ------------------------------------------------------------------------------
+-- 8. Identificação de Churn / Risco de Abandono
+-- Encontre os usuários que se cadastraram há mais de 6 meses, mas que não completaram 
+-- nenhum pedido nos últimos 4 meses (120 dias). Liste o ID, e-mail e país de cada um.
+-- ------------------------------------------------------------------------------
+WITH base_date AS (
+    SELECT MAX(order_date) AS hoje FROM orders
+)
+SELECT 
+    u.user_id, 
+    u.email, 
+    u.country
+FROM users u
+CROSS JOIN base_date bd
+WHERE DATEDIFF(bd.hoje, u.signup_date) > 180 
+  AND NOT EXISTS (
+      SELECT 1 
+      FROM orders o 
+      WHERE o.user_id = u.user_id 
+        AND DATEDIFF(bd.hoje, o.order_date) <= 120
+        AND o.status = 'Completed'
+  );
+
+
+-- ------------------------------------------------------------------------------
+-- 9. O Pedido de Maior Valor por País
+-- Traga o registro do pedido de maior valor (total_amount) feito dentro de cada 
+-- país. Retorne o país, nome do usuário, data e valor, mantendo o nível do pedido.
+-- ------------------------------------------------------------------------------
+WITH fil AS (
+    SELECT 
+        u.country, 
+        CONCAT(u.first_name, ' ', u.last_name) AS nome, 
+        o.order_date, 
+        o.total_amount,
+        ROW_NUMBER() OVER(PARTITION BY u.country ORDER BY o.total_amount DESC) AS ln
+    FROM users u
+    JOIN orders o ON u.user_id = o.user_id
+    WHERE o.status = 'Completed'
+)
+SELECT 
+    country,
+    nome, 
+    order_date, 
+    total_amount
+FROM fil 
+WHERE ln = 1
+ORDER BY total_amount DESC;
+
+
+-- ------------------------------------------------------------------------------
+-- 10. Funil de Vendas de Ponta a Ponta
+-- Crie um relatório de funil em linha única (ou múltiplas linhas) mostrando as 
+-- etapas: Sessões Web -> Pedidos criados -> Pagamentos de Sucesso. 
+-- Calcule a taxa de conversão final 
+-- ------------------------------------------------------------------------------
+WITH funil AS (
+    SELECT '1 - Sessões' AS etapa, COUNT(*) AS total FROM web_sessions
+    UNION ALL
+    SELECT '2 - Pedidos', COUNT(*) FROM orders
+    UNION ALL
+    SELECT '3 - Pagamentos Sucesso', COUNT(*) 
+    FROM payments 
+    WHERE status = 'Successful'
+)
+SELECT 
+    etapa, 
+    total,
+    ROUND(
+        100.0 * total / NULLIF((SELECT total FROM funil WHERE etapa = '1 - Sessões'), 0), 2
+    ) AS taxa_vs_sessoes
+FROM funil;
