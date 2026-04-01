@@ -232,3 +232,292 @@ SELECT
         100.0 * total / NULLIF((SELECT total FROM funil WHERE etapa = '1 - Sessões'), 0), 2
     ) AS taxa_vs_sessoes
 FROM funil;
+
+
+-- ------------------------------------------------------------------------------
+-- 11. Segmentação de Clientes por Valor Monetário (RFM - Monetário)
+-- Contexto: O time de CRM precisa classificar os clientes que já realizaram 
+-- compras para direcionar campanhas de marketing específicas.
+-- Objetivo: Calcule o valor total gasto por cada usuário em pedidos concluídos 
+-- e classifique-os em três categorias: 'Whale' (> $1000), 'Core' ($200 a $1000) 
+-- e 'Casual' (< $200).
+-- ------------------------------------------------------------------------------
+WITH fil AS (
+    SELECT 
+        u.user_id,
+        SUM(o.total_amount) AS total,
+        COUNT(*) AS qtde_pedidos
+    FROM users u
+    JOIN orders o ON u.user_id = o.user_id
+    WHERE o.status = 'Completed' 
+    GROUP BY u.user_id
+)
+SELECT 
+    user_id,
+    total,
+    qtde_pedidos,
+    CASE 
+        WHEN total < 200 THEN 'Casual'
+        WHEN total <= 1000 THEN 'Core'
+        ELSE 'Whale'
+    END AS Tier
+FROM fil
+ORDER BY total DESC;
+
+
+-- ------------------------------------------------------------------------------
+-- 12. Tempo Médio de Decisão (Time to First Conversion)
+-- Contexto: A equipe de UX quer entender quanto tempo um usuário leva para 
+-- ganhar confiança na plataforma e fazer sua primeira compra.
+-- Objetivo: Calcule a média de dias entre a data de cadastro e o primeiro 
+-- pedido concluído, agrupado pelo país.
+-- ------------------------------------------------------------------------------
+WITH fil AS (
+    SELECT 
+        u.user_id, 
+        u.country, 
+        u.signup_date, 
+        MIN(o.order_date) AS primeira_compra
+    FROM users u
+    JOIN orders o ON u.user_id = o.user_id
+    WHERE o.status = 'Completed'
+      AND o.order_date >= u.signup_date
+    GROUP BY u.user_id, u.country, u.signup_date
+)
+SELECT 
+    country, 
+    ROUND(AVG(DATEDIFF(primeira_compra, signup_date)), 2) AS media_dias
+FROM fil 
+GROUP BY country
+ORDER BY media_dias;
+
+
+-- ------------------------------------------------------------------------------
+-- 13. Métricas de Produto: ARPU Mensal (Average Revenue Per User)
+-- Contexto: Os investidores querem acompanhar a evolução do ARPU.
+-- Objetivo: Calcule a receita total gerada no mês dividida pelo número de 
+-- usuários únicos que fizeram pelo menos uma compra bem-sucedida naquele mês.
+-- ------------------------------------------------------------------------------
+SELECT 
+    DATE_FORMAT(order_date, '%Y-%m-01') AS mes,
+    SUM(total_amount) AS receita_mes,
+    COUNT(DISTINCT user_id) AS qtde_users,
+    ROUND(
+        SUM(total_amount) / NULLIF(COUNT(DISTINCT user_id), 0), 2
+    ) AS ARPU
+FROM orders
+WHERE status = 'Completed'
+GROUP BY mes
+ORDER BY mes;
+
+
+-- ------------------------------------------------------------------------------
+-- 14. Detecção de Anomalias / Outliers de Compra
+-- Contexto: O time de prevenção a fraudes precisa apontar compras atipicamente 
+-- altas em relação ao comportamento histórico do usuário.
+-- Objetivo: Encontre pedidos cujo valor seja pelo menos 3 vezes maior que o 
+-- AOV histórico do usuário (excluindo usuários com apenas 1 pedido).
+-- ------------------------------------------------------------------------------
+WITH user_stats AS (
+    SELECT 
+        order_id, 
+        user_id, 
+        order_date, 
+        total_amount,
+        AVG(total_amount) OVER (PARTITION BY user_id) AS aov_historico,
+        COUNT(order_id) OVER (PARTITION BY user_id) AS qtde_pedidos
+    FROM orders
+    WHERE status = 'Completed'
+)
+SELECT 
+    order_id, 
+    user_id, 
+    order_date, 
+    total_amount, 
+    ROUND(aov_historico, 2) AS AOV
+FROM user_stats
+WHERE qtde_pedidos > 1 
+  AND total_amount > (aov_historico * 3);
+
+
+-- ------------------------------------------------------------------------------
+-- 15. Market Basket Analysis Básica (Cross-Sell de Categorias)
+-- Contexto: O time de merchandising quer criar pacotes de produtos (bundles).
+-- Objetivo: Identifique o par mais popular de categorias diferentes compradas 
+-- pelo mesmo usuário ao longo de sua vida na plataforma.
+-- ------------------------------------------------------------------------------
+WITH fil AS (
+    SELECT DISTINCT 
+        o.user_id, 
+        p.category 
+    FROM products p
+    JOIN order_items oi ON p.product_id = oi.product_id
+    JOIN orders o ON oi.order_id = o.order_id
+    WHERE o.status = 'Completed'
+)
+SELECT 
+    f.category AS A,
+    f2.category AS B,
+    COUNT(DISTINCT f.user_id) AS qtde_users
+FROM fil f
+JOIN fil f2 ON f.user_id = f2.user_id 
+           AND f.category < f2.category
+GROUP BY f.category, f2.category
+ORDER BY qtde_users DESC
+LIMIT 1;
+
+
+-- ------------------------------------------------------------------------------
+-- 16. Crescimento Ano a Ano (YoY Growth com Window Functions)
+-- Contexto: A diretoria solicitou visão de performance comparando trimestres 
+-- contra o mesmo período do ano anterior.
+-- Objetivo: Agrupe a receita por Ano/Tri. Traga a receita do trimestre 
+-- equivalente no ano anterior e calcule a variação YoY.
+-- ------------------------------------------------------------------------------
+WITH fil AS (
+    SELECT 
+        YEAR(order_date) AS ano,
+        QUARTER(order_date) AS tri,
+        SUM(total_amount) AS total
+    FROM orders
+    WHERE status = 'Completed'
+    GROUP BY ano, tri
+),
+fil2 AS (
+    SELECT 
+        *,
+        LAG(total) OVER (PARTITION BY tri ORDER BY ano) AS receita_ano_ant
+    FROM fil
+)
+SELECT 
+    ano, 
+    CONCAT('Q', tri) AS trimestre, 
+    total, 
+    receita_ano_ant,
+    ROUND(
+        100.0 * (total - receita_ano_ant) / NULLIF(receita_ano_ant, 0), 2
+    ) AS YoY
+FROM fil2
+ORDER BY ano, tri;
+
+
+-- ------------------------------------------------------------------------------
+-- 17. Análise de Comportamento e Drop-off de Sessões
+-- Contexto: A equipe de produto quer comparar engajamento de conversões vs fugas.
+-- Objetivo: Duração média de sessões que converteram vs não converteram, 
+-- segmentado por dispositivo.
+-- ------------------------------------------------------------------------------
+WITH fil AS (
+    SELECT 
+        device_type,
+        AVG(CASE WHEN is_conversion = TRUE THEN duration_seconds END) AS avg_convertida,
+        AVG(CASE WHEN is_conversion = FALSE THEN duration_seconds END) AS avg_nao_convertida
+    FROM web_sessions
+    GROUP BY device_type
+)
+SELECT 
+    device_type,
+    ROUND(COALESCE(avg_convertida, 0), 2) AS avg_convertida_seg,
+    ROUND(COALESCE(avg_nao_convertida, 0), 2) AS avg_nao_convertida_seg,
+    ROUND(
+        COALESCE(avg_convertida, 0) - COALESCE(avg_nao_convertida, 0), 2
+    ) AS diferenca_seg
+FROM fil
+ORDER BY diferenca_seg DESC;
+
+
+-- ------------------------------------------------------------------------------
+-- 18. Retenção Dinâmica Month-over-Month (MoM Rolling Retention)
+-- Contexto: O time de Growth quer analisar a retenção contínua.
+-- Objetivo: Para cada mês base, conte quantos usuários compraram e quantos 
+-- retornaram no mês subsequente.
+-- ------------------------------------------------------------------------------
+WITH fil AS (
+    SELECT DISTINCT
+        user_id,
+        DATE_FORMAT(order_date, '%Y-%m-01') AS mes
+    FROM orders
+    WHERE status = 'Completed'
+),
+retencao AS (
+    SELECT 
+        f.mes, 
+        f.user_id, 
+        f2.user_id AS voltou
+    FROM fil f
+    LEFT JOIN fil f2 ON f.user_id = f2.user_id
+                    AND f2.mes = DATE_FORMAT(DATE_ADD(f.mes, INTERVAL 1 MONTH), '%Y-%m-01')
+)
+SELECT 
+    mes AS mes_base,
+    COUNT(DISTINCT user_id) AS total_usuarios,
+    COUNT(DISTINCT voltou) AS retornaram,
+    ROUND(
+        100.0 * COUNT(DISTINCT voltou) / NULLIF(COUNT(DISTINCT user_id), 0), 2
+    ) AS taxa_retencao
+FROM retencao
+GROUP BY mes
+ORDER BY mes;
+
+
+-- ------------------------------------------------------------------------------
+-- 19. Sessionização de Eventos (Identificação de Gaps de Atividade)
+-- Contexto: Engenharia de dados quer agrupar sessões próximas em "Macro-Sessões".
+-- Objetivo: Se o gap entre sessões for > 2 horas, inicia-se uma nova Macro-Sessão.
+-- ------------------------------------------------------------------------------
+WITH fil AS (
+    SELECT 
+        user_id,
+        duration_seconds,
+        session_date AS sessao_atual,
+        LAG(session_date) OVER (PARTITION BY user_id ORDER BY session_date) AS sessao_anterior
+    FROM web_sessions
+)
+SELECT 
+    user_id,
+    1 + COUNT(
+        CASE WHEN sessao_anterior IS NOT NULL 
+             AND TIMESTAMPDIFF(SECOND, sessao_anterior, sessao_atual) > 7200 THEN 1 END
+    ) AS `Macro-Sessão`
+FROM fil
+GROUP BY user_id;
+
+
+-- ------------------------------------------------------------------------------
+-- 20. Ponto de Equilíbrio do LTV (Cumulative Break-Even Point)
+-- Contexto: Assuma que o CAC é $50. Precisamos descobrir o exato pedido em que 
+-- a empresa parou de perder dinheiro com o cliente e começou a lucrar.
+-- Objetivo: Calcule o lucro acumulado (Receita - Custos - CAC). Encontre o 
+-- primeiro pedido onde o saldo fica positivo.
+-- ------------------------------------------------------------------------------
+WITH fil AS (
+    SELECT 
+        o.user_id, 
+        o.order_id, 
+        o.order_date,
+        SUM(oi.quantity * (p.price - p.cost)) AS total
+    FROM orders o
+    JOIN order_items oi ON o.order_id = oi.order_id
+    JOIN products p ON oi.product_id = p.product_id
+    GROUP BY o.user_id, o.order_id, o.order_date
+),
+lucro_real AS (
+    SELECT 
+        *,
+        SUM(total) OVER (PARTITION BY user_id ORDER BY order_date) - 50.0 AS lucro
+    FROM fil
+),
+break_even AS (
+    SELECT 
+        *,
+        ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY order_date) AS ln
+    FROM lucro_real
+    WHERE lucro > 0
+)
+SELECT 
+    user_id, 
+    order_id, 
+    order_date, 
+    lucro 
+FROM break_even
+WHERE ln = 1;
