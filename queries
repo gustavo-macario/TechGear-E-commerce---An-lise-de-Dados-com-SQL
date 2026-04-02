@@ -521,3 +521,280 @@ SELECT
     lucro 
 FROM break_even
 WHERE ln = 1;
+
+
+-- ------------------------------------------------------------------------------
+-- 21. Produtos "Isca" (Loss Leaders) e Margem Negativa
+-- Contexto: O time comercial vende alguns produtos abaixo do custo de propósito 
+-- para atrair clientes, mas o financeiro quer saber o tamanho desse buraco.
+-- Objetivo: Identifique quais produtos geraram lucro negativo (prejuízo) 
+-- totalizando todo o histórico de vendas concluídas.
+-- ------------------------------------------------------------------------------
+SELECT 
+    p.product_name, 
+    p.category, 
+    SUM(oi.quantity) AS qtde_total, 
+    SUM((p.price - p.cost) * oi.quantity) AS prejuizo_total 
+FROM order_items oi
+JOIN products p ON oi.product_id = p.product_id
+JOIN orders o ON oi.order_id = o.order_id
+WHERE o.status = 'Completed' 
+GROUP BY p.product_id, p.product_name, p.category
+HAVING prejuizo_total < 0
+ORDER BY prejuizo_total ASC;
+
+
+-- ------------------------------------------------------------------------------
+-- 22. Ciclo de Recompra (Time Between Purchases)
+-- Contexto: O time de CRM quer automatizar disparos de e-mail exatamente 
+-- no momento em que o cliente costuma fazer a próxima compra.
+-- Objetivo: Apenas para usuários que completaram mais de um pedido, calcule o 
+-- tempo médio (em dias) que eles levam entre um pedido e o próximo.
+-- ------------------------------------------------------------------------------
+WITH compras AS (
+    SELECT 
+        o.user_id,
+        o.order_id, 
+        o.order_date,
+        LAG(o.order_date) OVER (PARTITION BY o.user_id ORDER BY o.order_date) AS data_anterior,
+        COUNT(*) OVER (PARTITION BY o.user_id) AS total_pedidos
+    FROM orders o
+    WHERE o.status = 'Completed'
+),
+intervalos AS (
+    SELECT  
+        user_id, 
+        total_pedidos, 
+        DATEDIFF(order_date, data_anterior) AS dias
+    FROM compras
+    WHERE data_anterior IS NOT NULL
+)
+SELECT  
+    user_id, 
+    total_pedidos,
+    ROUND(AVG(dias), 1) AS tempo_medio_recompra
+FROM intervalos
+WHERE total_pedidos > 1
+GROUP BY user_id, total_pedidos
+ORDER BY tempo_medio_recompra;
+
+
+-- ------------------------------------------------------------------------------
+-- 23. Receita Bruta (GMV) vs Receita Líquida (Net Revenue)
+-- Contexto: Pedidos criados geram expectativa, mas pedidos pagos e não 
+-- estornados geram dinheiro real. A diretoria quer ver essa quebra.
+-- Objetivo: Agrupe por Ano/Mês e calcule o GMV e a Receita Líquida (apenas 
+-- pagamentos 'Successful'). Calcule também a Taxa de Perda Financeira.
+-- ------------------------------------------------------------------------------
+WITH pagamentos_sucesso AS (
+    SELECT 
+        order_id,
+        SUM(amount) AS total_success
+    FROM payments
+    WHERE status = 'Successful'
+    GROUP BY order_id
+),
+fil AS (
+    SELECT 
+        DATE_FORMAT(o.order_date, '%Y-%m-01') AS mes,
+        SUM(o.total_amount) AS GMV,
+        SUM(COALESCE(p.total_success, 0)) AS receita_liquida
+    FROM orders o
+    LEFT JOIN pagamentos_sucesso p ON o.order_id = p.order_id
+    GROUP BY DATE_FORMAT(o.order_date, '%Y-%m-01')
+)
+SELECT 
+    mes,
+    GMV,
+    receita_liquida,
+    ROUND(100.0 * (GMV - receita_liquida) / NULLIF(GMV, 0), 2) AS taxa_de_perda
+FROM fil
+ORDER BY mes;
+
+
+-- ------------------------------------------------------------------------------
+-- 24. O Princípio de Pareto (A Curva ABC / 80/20)
+-- Contexto: Diz a regra de Pareto que 80% do seu faturamento vem de 20% dos 
+-- seus clientes. Precisamos comprovar isso.
+-- Objetivo: Liste o valor total gasto por usuário e crie uma coluna de % 
+-- Acumulado. Identifique quem compõe os top 80% da receita.
+-- ------------------------------------------------------------------------------
+WITH fil AS (
+    SELECT 
+        u.user_id, 
+        SUM(o.total_amount) AS total_gasto,
+        ROUND(
+            100.0 * SUM(o.total_amount) / 
+            NULLIF((SELECT SUM(total_amount) FROM orders WHERE status = 'Completed'), 0), 2
+        ) AS user_porc
+    FROM users u 
+    JOIN orders o ON u.user_id = o.user_id
+    WHERE o.status = 'Completed'
+    GROUP BY u.user_id
+)
+SELECT 
+    user_id,
+    total_gasto,
+    user_porc,
+    SUM(user_porc) OVER (ORDER BY total_gasto DESC) AS porcentagem_acumulada,
+    CASE 
+        WHEN SUM(user_porc) OVER (ORDER BY total_gasto DESC) <= 80 THEN 'Top 80% (Pareto)' 
+        ELSE 'Cauda Longa'
+    END AS classificacao
+FROM fil
+ORDER BY total_gasto DESC;
+
+
+-- ------------------------------------------------------------------------------
+-- 25. Análise de Comportamento Cross-Device (Omnichannel)
+-- Contexto: Usuários que interagem com a marca pelo Celular e pelo Computador 
+-- costumam ter um LTV maior.
+-- Objetivo: Identifique quais usuários acessaram o site utilizando mais de um 
+-- tipo de dispositivo distinto ao longo de toda a sua história.
+-- ------------------------------------------------------------------------------
+SELECT 
+    u.user_id, 
+    CONCAT(u.first_name, ' ', u.last_name) AS nome,
+    COUNT(DISTINCT w.device_type) AS disp_unicos
+FROM users u
+JOIN web_sessions w ON u.user_id = w.user_id
+GROUP BY u.user_id, nome
+HAVING disp_unicos > 1
+ORDER BY disp_unicos DESC;
+
+
+-- ------------------------------------------------------------------------------
+-- 26. Média Móvel Diária de 3 Dias (Rolling Average)
+-- Contexto: Vendas diárias oscilam muito. O financeiro quer suavizar o gráfico.
+-- Objetivo: Calcule a Receita por dia e crie uma coluna com a Média Móvel 
+-- dos últimos 3 dias (o dia atual + os 2 anteriores).
+-- ------------------------------------------------------------------------------
+WITH fil AS (
+    SELECT 
+        DATE_FORMAT(payment_date, '%Y-%m-%d') AS dias, 
+        SUM(amount) AS total_dia
+    FROM payments
+    WHERE status = 'Successful'
+    GROUP BY DATE_FORMAT(payment_date, '%Y-%m-%d') 
+)
+SELECT 
+    dias,
+    total_dia,
+    ROUND(
+        AVG(total_dia) OVER (ORDER BY dias ROWS BETWEEN 2 PRECEDING AND CURRENT ROW), 2
+    ) AS media_ultimos_3_dias
+FROM fil;
+
+
+-- ------------------------------------------------------------------------------
+-- 27. Taxa de Sucesso e Estorno por Gateway de Pagamento
+-- Contexto: A empresa paga taxas diferentes dependendo do método e precisa 
+-- monitorar a saúde tecnológica de cada gateway.
+-- Objetivo: Traga o total de tentativas e os percentuais de Sucesso, Falha 
+-- e Reembolso por Método de Pagamento.
+-- ------------------------------------------------------------------------------
+SELECT  
+    payment_method,
+    COUNT(*) AS total_transacoes,
+    ROUND(100.0 * COUNT(CASE WHEN status = 'Successful' THEN 1 END) / COUNT(*), 2) AS perc_sucesso,
+    ROUND(100.0 * COUNT(CASE WHEN status = 'Failed' THEN 1 END) / COUNT(*), 2) AS perc_falha,
+    ROUND(100.0 * COUNT(CASE WHEN status = 'Refunded' THEN 1 END) / COUNT(*), 2) AS perc_reembolso
+FROM payments
+GROUP BY payment_method
+ORDER BY total_transacoes DESC;
+
+
+-- ------------------------------------------------------------------------------
+-- 28. Primeira Compra vs. Compras Subsequentes
+-- Contexto: O cliente gasta mais depois de ganhar confiança na marca?
+-- Objetivo: Calcule o Ticket Médio (AOV) apenas dos primeiros pedidos e 
+-- compare com o Ticket Médio dos segundos pedidos em diante.
+-- ------------------------------------------------------------------------------
+WITH fil AS (
+    SELECT 
+        user_id, 
+        order_date, 
+        total_amount,
+        ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY order_date) AS ln
+    FROM orders
+    WHERE status = 'Completed'
+)
+SELECT 
+    CASE 
+        WHEN ln = 1 THEN 'Primeira Compra' 
+        ELSE 'Recompra'
+    END AS Tipo_Pedido,
+    ROUND(AVG(total_amount), 2) AS media,
+    COUNT(*) AS qtde_pedidos
+FROM fil
+GROUP BY 
+    CASE 
+        WHEN ln = 1 THEN 'Primeira Compra'
+        ELSE 'Recompra'
+    END
+ORDER BY media DESC;
+
+
+-- ------------------------------------------------------------------------------
+-- 29. Oportunidade de Campanha de Win-back (Retargeting)
+-- Contexto: Usuários pararam de comprar, mas recentemente voltaram a navegar.
+-- Objetivo: Encontre usuários com última compra há mais de 90 dias, mas que 
+-- tiveram pelo menos uma Sessão Web nos últimos 30 dias.
+-- ------------------------------------------------------------------------------
+WITH base_date AS (
+    SELECT MAX(order_date) AS hoje FROM orders
+),
+ultimos_pedidos AS (
+    SELECT 
+        user_id, 
+        MAX(order_date) AS ult_compra
+    FROM orders
+    WHERE status = 'Completed'
+    GROUP BY user_id
+),
+ultimas_sessoes AS (
+    SELECT 
+        user_id, 
+        MAX(session_date) AS ult_sessao
+    FROM web_sessions
+    GROUP BY user_id
+)
+SELECT  
+    u.user_id,
+    CONCAT(u.first_name, ' ', u.last_name) AS Nome,
+    DATEDIFF(bd.hoje, p.ult_compra) AS dias_desde_ult_compra,
+    DATEDIFF(bd.hoje, s.ult_sessao) AS dias_desde_ult_sessao
+FROM users u
+CROSS JOIN base_date bd
+JOIN ultimos_pedidos p ON u.user_id = p.user_id
+JOIN ultimas_sessoes s ON u.user_id = s.user_id
+WHERE DATEDIFF(bd.hoje, p.ult_compra) > 90
+  AND DATEDIFF(bd.hoje, s.ult_sessao) <= 30;
+
+
+-- ------------------------------------------------------------------------------
+-- 30. Identificação do Culpado (Produto que "azeda" a cesta)
+-- Contexto: Às vezes, um produto ruim gera a devolução de um pedido inteiro.
+-- Objetivo: Qual é o produto que mais aparece nas cestas (pedidos) que acabam 
+-- sendo cancelados ou reembolsados?
+-- ------------------------------------------------------------------------------
+WITH fil AS (
+    SELECT 
+        p.product_name,
+        COUNT(CASE WHEN o.status = 'Completed' AND py.status = 'Successful' THEN 1 END) AS pedidos_sucessos,
+        COUNT(CASE WHEN o.status = 'Cancelled' OR py.status = 'Refunded' THEN 1 END) AS cancelados_reembolsados,
+        COUNT(o.order_id) AS qtde_pedidos
+    FROM products p 
+    LEFT JOIN order_items oi ON p.product_id = oi.product_id
+    LEFT JOIN orders o ON oi.order_id = o.order_id
+    LEFT JOIN payments py ON o.order_id = py.order_id
+    GROUP BY p.product_id, p.product_name
+)
+SELECT 
+    product_name,
+    pedidos_sucessos,
+    cancelados_reembolsados,
+    ROUND((100.0 * cancelados_reembolsados) / NULLIF(qtde_pedidos, 0), 2) AS taxa_cancelamento_falha
+FROM fil
+ORDER BY taxa_cancelamento_falha DESC
+LIMIT 1;
