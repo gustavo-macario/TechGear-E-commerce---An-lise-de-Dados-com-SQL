@@ -798,3 +798,140 @@ SELECT
 FROM fil
 ORDER BY taxa_cancelamento_falha DESC
 LIMIT 1;
+
+
+-- ------------------------------------------------------------------------------
+-- 31. Market Basket Analysis (Produtos Comprados Juntos)
+-- Contexto: Alimentar o sistema de recomendação "Quem comprou X também comprou Y".
+-- Objetivo: Encontrar pares de produtos que aparecem no mesmo pedido, evitando
+-- duplicatas espelhadas (A-B e B-A) e o auto-par (A-A).
+-- ------------------------------------------------------------------------------
+SELECT
+p1.product_name AS Produto_A,
+p2.product_name AS Produto_B,
+COUNT(*) AS qtde_pedidos
+FROM order_items o1
+JOIN order_items o2 ON o1.order_id = o2.order_id AND o1.product_id < o2.product_id
+JOIN products p1 ON o1.product_id = p1.product_id
+JOIN products p2 ON o2.product_id = p2.product_id
+GROUP BY p1.product_name, p2.product_name
+ORDER BY qtde_pedidos DESC;
+
+
+-- ------------------------------------------------------------------------------
+-- 32. Análise de Coorte de Retenção (Cohort Analysis)
+-- Contexto: Verificar se usuários novos continuam comprando nos meses seguintes.
+-- Objetivo: Agrupar por mês de cadastro e calcular a retenção (em %) para o
+-- Mês 0 (mesmo mês), Mês 1 e Mês 2.
+-- ------------------------------------------------------------------------------
+WITH base_coorte AS (
+SELECT
+DATE_FORMAT(signup_date, '%Y-%m') AS mes_cadastro,
+COUNT(user_id) AS total_usuarios
+FROM users
+GROUP BY DATE_FORMAT(signup_date, '%Y-%m')
+),
+comportamento AS (
+SELECT
+DATE_FORMAT(u.signup_date, '%Y-%m') AS mes_cadastro,
+COUNT(DISTINCT CASE WHEN TIMESTAMPDIFF(MONTH, u.signup_date, o.order_date) = 0 THEN u.user_id END) AS comprou_mes_0,
+COUNT(DISTINCT CASE WHEN TIMESTAMPDIFF(MONTH, u.signup_date, o.order_date) = 1 THEN u.user_id END) AS comprou_mes_1,
+COUNT(DISTINCT CASE WHEN TIMESTAMPDIFF(MONTH, u.signup_date, o.order_date) = 2 THEN u.user_id END) AS comprou_mes_2
+FROM users u
+JOIN orders o ON u.user_id = o.user_id
+WHERE o.status = 'Completed'
+GROUP BY DATE_FORMAT(u.signup_date, '%Y-%m')
+)
+SELECT
+b.mes_cadastro AS Coorte,
+b.total_usuarios,
+ROUND(100.0 * IFNULL(c.comprou_mes_0, 0) / b.total_usuarios, 2) AS perc_mes_0,
+ROUND(100.0 * IFNULL(c.comprou_mes_1, 0) / b.total_usuarios, 2) AS perc_mes_1,
+ROUND(100.0 * IFNULL(c.comprou_mes_2, 0) / b.total_usuarios, 2) AS perc_mes_2
+FROM base_coorte b
+LEFT JOIN comportamento c ON b.mes_cadastro = c.mes_cadastro
+ORDER BY b.mes_cadastro;
+
+-- ------------------------------------------------------------------------------
+-- 33. Gaps and Islands (Maior Streak de Acessos)
+-- Contexto: Premiar os usuários com maior engajamento (dias consecutivos).
+-- Objetivo: Identificar a maior sequência (streak) de dias seguidos que cada
+-- usuário acessou a plataforma usando a lógica de subtração de ROW_NUMBER.
+-- ------------------------------------------------------------------------------
+WITH fil AS (
+SELECT DISTINCT user_id, DATE(session_date) AS dias
+FROM web_sessions
+),
+sequencia AS (
+SELECT user_id, dias,
+ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY dias) AS ln
+FROM fil
+),
+dias_consecutivos AS (
+SELECT user_id, dias,
+DATE_SUB(dias, INTERVAL ln DAY) AS grupo
+FROM sequencia
+),
+total_dias AS (
+SELECT user_id,
+COUNT(*) AS num_dias
+FROM dias_consecutivos
+GROUP BY user_id, grupo
+)
+SELECT user_id, MAX(num_dias) AS num_dias_acessados
+FROM total_dias
+GROUP BY user_id
+ORDER BY num_dias_acessados DESC;
+
+
+-- ------------------------------------------------------------------------------
+-- 34. Funil de Conversão Temporal (Time-to-First-Purchase)
+-- Contexto: Entender a velocidade de conversão de novos usuários.
+-- Objetivo: Calcular o tempo em horas entre cadastro e primeira compra,
+-- categorizando em faixas e calculando a representatividade (%) sobre o total.
+-- ------------------------------------------------------------------------------
+WITH fil AS (
+SELECT
+u.user_id,
+TIMESTAMPDIFF(HOUR, u.signup_date, MIN(o.order_date)) AS horas_ate_compra
+FROM users u
+LEFT JOIN orders o ON u.user_id = o.user_id
+GROUP BY u.user_id
+),
+ord AS (
+SELECT user_id,
+CASE
+WHEN horas_ate_compra < 24 THEN '< 24h'
+WHEN horas_ate_compra BETWEEN 24 AND 168 THEN '24h a 7 dias'
+ELSE '> 7 dias ou Nunca Comprou'
+END AS categoria_tempo
+FROM fil
+)
+SELECT
+categoria_tempo,
+COUNT() AS qtde,
+ROUND(100.0 * COUNT() / NULLIF((SELECT COUNT(*) FROM users), 0), 2) AS porcentagem
+FROM ord
+GROUP BY categoria_tempo
+ORDER BY qtde DESC;
+
+
+-- ------------------------------------------------------------------------------
+-- 35. Ponto de Virada (Receita Acumulada - Running Total)
+-- Contexto: Identificar o momento exato em que a meta de faturamento foi batida.
+-- Objetivo: Calcular a soma acumulada cronológica e isolar a linha onde
+-- a receita líquida ultrapassou os R$ 5.000,00 pela primeira vez.
+-- ------------------------------------------------------------------------------
+WITH fil AS (
+SELECT
+payment_date,
+amount,
+SUM(amount) OVER (ORDER BY payment_date ASC) AS soma_acumulada
+FROM payments
+WHERE status = 'Successful'
+)
+SELECT payment_date, amount, soma_acumulada
+FROM fil
+WHERE soma_acumulada >= 5000
+ORDER BY payment_date ASC
+LIMIT 1;
