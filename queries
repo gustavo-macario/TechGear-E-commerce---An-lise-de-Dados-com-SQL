@@ -935,3 +935,120 @@ FROM fil
 WHERE soma_acumulada >= 5000
 ORDER BY payment_date ASC
 LIMIT 1;
+
+
+
+-- ------------------------------------------------------------------------------
+-- 36. A Teia da Duplicidade: Pedidos de Múltiplos Gateways
+-- Contexto: Lembra que um pedido pode ter tentativas falhas antes do sucesso? 
+-- Precisamos auditar esse atrito.
+-- Objetivo: Identifique pedidos que possuem mais de uma tentativa na tabela payments. 
+-- Para esses pedidos, calcule o tempo médio (em minutos) entre a primeira tentativa 
+-- (independente do status) e a tentativa que finalmente deu 'Successful'.
+-- ------------------------------------------------------------------------------
+WITH fil AS (
+    SELECT 
+        o.order_id, 
+        COUNT(p.payment_id) AS qtde_tentativas, 
+        MIN(p.payment_date) AS min_date, 
+        MAX(CASE WHEN p.status = 'Successful' THEN p.payment_date END) AS max_date
+    FROM orders o
+    JOIN payments p ON o.order_id = p.order_id
+    GROUP BY o.order_id
+    HAVING COUNT(p.payment_id) > 1 
+)
+SELECT 
+    order_id, 
+    qtde_tentativas, 
+    TIMESTAMPDIFF(MINUTE, min_date, max_date) AS tempo_medio
+FROM fil;
+
+-- ------------------------------------------------------------------------------
+-- 37. Crescimento Ano a Ano (YoY - Year over Year)
+-- Contexto: Comparar maio deste ano com abril deste ano engana (sazonalidade). 
+-- Precisamos comparar maio deste ano com maio do ano passado.
+-- Objetivo: Liste o GMV (pedidos criados) por Ano/Mês. Crie uma coluna que traga 
+-- o GMV do exato mesmo mês no ano anterior. Por fim, calcule o % de crescimento.
+-- ------------------------------------------------------------------------------
+WITH fil AS (
+    SELECT 
+        DATE_FORMAT(order_date, '%Y-%m') AS ano_mes,
+        SUM(total_amount) AS total
+    FROM orders 
+    GROUP BY ano_mes
+)
+SELECT 
+    *,
+    LAG(total, 12) OVER (ORDER BY ano_mes) AS prev_ano_mes_total,
+    ROUND(100.0 * (total - LAG(total, 12) OVER (ORDER BY ano_mes)) 
+    / 
+    NULLIF(LAG(total, 12) OVER (ORDER BY ano_mes), 0), 2) AS YoY
+FROM fil;
+
+-- ------------------------------------------------------------------------------
+-- 38. Divisão Relacional (Os Exploradores Completos)
+-- Contexto: Quem são os "Super Usuários" de tecnologia que testaram nosso site 
+-- em todas as telas possíveis?
+-- Objetivo: Encontre os usuários que possuem sessões registradas usando absolutamente 
+-- todos os device_type que existem catalogados na tabela web_sessions de forma dinâmica.
+-- ------------------------------------------------------------------------------
+WITH dispositivos_unicos AS (
+    SELECT COUNT(DISTINCT device_type) AS qtde_dipositivos
+    FROM web_sessions
+)
+SELECT 
+    user_id, 
+    COUNT(DISTINCT device_type) AS qtde_user
+FROM web_sessions w 
+GROUP BY user_id
+HAVING qtde_user = (SELECT qtde_dipositivos FROM dispositivos_unicos)
+ORDER BY user_id;
+
+-- ------------------------------------------------------------------------------
+-- 39. Flutuação de Preço e Detecção de Anomalia
+-- Contexto: O preço varia, mas queremos detectar vendas com descontos excessivos.
+-- Objetivo: Analise a tabela order_items. Identifique itens vendidos por um valor 
+-- 20% menor do que a média histórica de venda daquele exato mesmo produto.
+-- ------------------------------------------------------------------------------
+WITH media_historica AS (
+    SELECT 
+        oi.product_id, 
+        AVG(oi.unit_price) AS media 
+    FROM order_items oi
+    GROUP BY oi.product_id
+)
+SELECT 
+    o.order_id, 
+    o.product_id,
+    o.unit_price AS preco_pago, 
+    ROUND(m.media, 2) AS media_historica,
+    ROUND(100.0 * (m.media - o.unit_price) / NULLIF(m.media, 0), 2) AS perc_desconto
+FROM order_items o
+JOIN media_historica m ON o.product_id = m.product_id
+WHERE o.unit_price <= (m.media * 0.80);
+
+-- ------------------------------------------------------------------------------
+-- 40. O Efeito Canibalização de Carrinho
+-- Contexto: Produtos "Isca" (vendidos com prejuízo) são aceitáveis se o cliente 
+-- levar produtos lucrativos no mesmo pedido. Mas e se ele só comprar a isca?
+-- Objetivo: Isole todos os pedidos finalizados que contêm pelo menos um produto 
+-- vendido com lucro negativo. Calcule o Lucro Total da cesta inteira e 
+-- identifique quantos terminaram com Lucro Final Negativo.
+-- ------------------------------------------------------------------------------
+WITH fil AS (
+    SELECT 
+        o.order_id, 
+        COUNT(CASE WHEN p.cost > oi.unit_price THEN 1 END) AS qtde_isca,
+        SUM((oi.unit_price - p.cost) * oi.quantity) AS lucro
+    FROM orders o 
+    JOIN order_items oi ON o.order_id = oi.order_id
+    JOIN products p ON oi.product_id = p.product_id
+    WHERE o.status = 'Completed'
+    GROUP BY o.order_id
+)
+SELECT 
+    COUNT(*) AS qtde_pedidos_com_isca, 
+    SUM(CASE WHEN lucro < 0 THEN 1 ELSE 0 END) AS qtde_produtos_prejuizo, 
+    ROUND(100.0 * COUNT(CASE WHEN lucro < 0 THEN 1 END) / NULLIF(COUNT(*), 0), 2) AS pedidos_canibalizados
+FROM fil
+WHERE qtde_isca > 0;
